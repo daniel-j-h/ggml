@@ -1,0 +1,45 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// DSV4 HC Pre: x[n_embd, hc, n_tokens] * weights[hc, n_tokens] -> dst[n_embd, n_tokens]
+// For each (i, t): dst[i, t] = sum_h x[i, h, t] * weights[h, t]
+// hc is always 4 in practice (verified at runtime).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer X { float x_data[]; };
+layout(binding = 1) readonly buffer W { float w_data[]; };
+layout(binding = 2) writeonly buffer Dst { float dst_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_embd;       // x->ne[0]
+    uint hc;           // x->ne[1] (always 4)
+    uint n_tokens;     // x->ne[2]
+    uint nb_x_embd;    // x->nb[0] / 4 (stride for i dimension)
+    uint nb_x_hc;      // x->nb[1] / 4 (stride for h dimension)
+    uint nb_x_tok;     // x->nb[2] / 4 (stride for t dimension)
+    uint nb_w_hc;      // weights->nb[0] / 4 (stride for h dimension)
+    uint nb_w_tok;     // weights->nb[1] / 4 (stride for t dimension)
+    uint nb_dst_embd;  // dst->nb[0] / 4
+    uint nb_dst_tok;   // dst->nb[1] / 4
+};
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    // Total work: n_embd * n_tokens
+    if (idx >= n_embd * n_tokens) { return; }
+
+    const uint i0 = idx % n_embd;
+    const uint it = idx / n_embd;
+
+    // Sum over hc dimensions
+    float sum = 0.0;
+    [[unroll]] for (uint ih = 0; ih < hc; ++ih) {
+        const float xv = x_data[i0 * nb_x_embd + ih * nb_x_hc + it * nb_x_tok];
+        const float wv = w_data[ih * nb_w_hc  + it * nb_w_tok];
+        sum += xv * wv;
+    }
+
+    dst_data[i0 * nb_dst_embd + it * nb_dst_tok] = sum;
+}

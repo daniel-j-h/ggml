@@ -1,0 +1,118 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// DSV4 HC Comb: mixes[(2+hc)*hc, n_tokens], scale[3], base[(2+hc)*hc] -> dst[hc, hc, n_tokens]
+// hc is always 4 in practice.
+//
+// For each token t:
+//   1. Build 4x4 comb matrix from mixes[comb_offset + dst + hc*src, t] * scale[2] + base[comb_offset + dst + hc*src]
+//   2. Softmax over dst (rows)
+//   3. Add eps
+//   4. Normalize over src (cols)
+//   5. Repeat norm_rows + norm_cols for n_iter - 1 iterations
+//   6. Write result to dst[dst, src, t]
+
+const uint HC = 4;
+const uint COMB_OFFSET = 2 * HC;        // 8
+const uint HC_MIX_DIM = (2 + HC) * HC;  // 24
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Mixes { float mixes_data[]; };
+layout(binding = 1) readonly buffer Scale { float scale_data[]; };
+layout(binding = 2) readonly buffer Base  { float base_data[];  };
+layout(binding = 3) writeonly buffer Dst  { float dst_data[];   };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tokens;       // mixes->ne[1]
+    uint nb_mixes_tok;   // mixes->nb[1] / 4
+    uint nb_scale_0;     // scale->nb[0] / 4
+    uint nb_base_0;      // base->nb[0] / 4
+    float eps;
+    int n_iter;
+    uint nb_dst_src;     // dst->nb[1] / 4
+    uint nb_dst_tok;     // dst->nb[2] / 4
+};
+
+// Normalize columns: for each column dst, sum over rows src and divide each row
+void norm_cols(inout float comb[HC*HC], float eps) {
+    [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+        float sum = eps;
+        [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+            sum += comb[idst + HC*isrc];
+        }
+        const float inv_sum = 1.0f / sum;
+        [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+            comb[idst + HC*isrc] *= inv_sum;
+        }
+    }
+}
+
+// Normalize rows: for each row src, sum over columns dst and divide each column
+void norm_rows(inout float comb[HC*HC], float eps) {
+    [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+        float sum = eps;
+        [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+            sum += comb[idst + HC*isrc];
+        }
+        const float inv_sum = 1.0f / sum;
+        [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+            comb[idst + HC*isrc] *= inv_sum;
+        }
+    }
+}
+
+void main() {
+    const uint it = gl_GlobalInvocationID.x;
+    if (it >= n_tokens) { return; }
+
+    // Read scale_comb = scale[2]
+    const float scale_comb = scale_data[2 * nb_scale_0];
+
+    // Build the 4x4 comb matrix
+    float comb[HC*HC];
+
+    [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+        // Softmax over dst for each src row
+        float max_val = -1.0/0.0;  // -Infinity
+        [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+            const uint idx = COMB_OFFSET + idst + HC*isrc;
+            const float xv = mixes_data[idx * nb_mixes_tok + it];
+            const float bv = base_data[idx * nb_base_0];
+            const float v = xv * scale_comb + bv;
+            comb[idst + HC*isrc] = v;
+            max_val = max(max_val, v);
+        }
+
+        // Softmax: exp(v - max) / sum
+        float sum = 0.0;
+        [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+            const uint idx = idst + HC*isrc;
+            const float v = exp(comb[idx] - max_val);
+            comb[idx] = v;
+            sum += v;
+        }
+
+        const float inv_sum = 1.0f / sum;
+        [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+            const uint idx = idst + HC*isrc;
+            comb[idx] = comb[idx] * inv_sum + eps;
+        }
+    }
+
+    // Sinkhorn normalization
+    norm_cols(comb, eps);
+    for (int i = 1; i < n_iter; ++i) {
+        norm_rows(comb, eps);
+        norm_cols(comb, eps);
+    }
+
+    // Write result
+    [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+        [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+            const uint idx = idst + HC*isrc;
+            dst_data[idst * nb_dst_src + isrc + it * nb_dst_tok] = comb[idx];
+        }
+    }
+}

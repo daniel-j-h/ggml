@@ -1,0 +1,86 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// DSV4 HC Post (optimized):
+//   x[n_embd, n_tokens],
+//   residual[n_embd, hc, n_tokens],
+//   post[hc, n_tokens],
+//   comb[dst_hc=hc, src_hc=hc, n_tokens]
+//   -> dst[n_embd, hc, n_tokens]
+//
+// Each thread handles all 4 dst HC streams for one (i, t) pair.
+//   For dst = 0..3:
+//     dst[i, dst, t] = x[i, t] * post[dst, t] + sum_src residual[i, src, t] * comb[dst, src, t]
+// hc is always 4.
+//
+// Total workgroup count: n_embd * n_tokens  (4x fewer than the naive per-dst-thread approach)
+
+const uint HC = 4;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer X        { float x_data[];        };
+layout(binding = 1) readonly buffer Residual { float residual_data[]; };
+layout(binding = 2) readonly buffer Post     { float post_data[];     };
+layout(binding = 3) readonly buffer Comb     { float comb_data[];     };
+layout(binding = 4) writeonly buffer Dst     { float dst_data[];      };
+
+layout(push_constant) uniform PushConstants {
+    uint n_embd;          // x->ne[0]
+    uint n_tokens;        // x->ne[1]
+    uint nb_x_embd;       // x->nb[0] / 4
+    uint nb_x_tok;        // x->nb[1] / 4
+    uint nb_r_embd;       // residual->nb[0] / 4
+    uint nb_r_hc;         // residual->nb[1] / 4
+    uint nb_r_tok;        // residual->nb[2] / 4
+    uint nb_p_hc;         // post->nb[0] / 4
+    uint nb_p_tok;        // post->nb[1] / 4
+    uint nb_c_dst;        // comb->nb[0] / 4
+    uint nb_c_src;        // comb->nb[1] / 4
+    uint nb_c_tok;        // comb->nb[2] / 4
+    uint nb_dst_embd;     // dst->nb[0] / 4
+    uint nb_dst_hc;       // dst->nb[1] / 4
+    uint nb_dst_tok;      // dst->nb[2] / 4
+};
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    // Total work: n_embd * n_tokens
+    if (idx >= n_embd * n_tokens) { return; }
+
+    const uint i0 = idx % n_embd;
+    const uint it = idx / n_embd;
+
+    // Load x[i, t] once (reused for all 4 dst streams)
+    const float xv = x_data[i0 * nb_x_embd + it * nb_x_tok];
+
+    // Load all 4 residual streams for this (i, t)
+    float res[HC];
+    [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+        res[isrc] = residual_data[i0 * nb_r_embd + isrc * nb_r_hc + it * nb_r_tok];
+    }
+
+    // Load all 4 post values for this t
+    float pv[HC];
+    [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+        pv[idst] = post_data[idst * nb_p_hc + it * nb_p_tok];
+    }
+
+    // Load the 4x4 comb matrix for this t
+    float cv[HC * HC];
+    [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+        [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+            cv[idst + isrc * HC] = comb_data[idst * nb_c_dst + isrc * nb_c_src + it * nb_c_tok];
+        }
+    }
+
+    // Compute all 4 dst HC streams
+    [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+        float sum = xv * pv[idst];
+        [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+            sum += res[isrc] * cv[idst + isrc * HC];
+        }
+        dst_data[i0 * nb_dst_embd + idst * nb_dst_hc + it * nb_dst_tok] = sum;
+    }
+}

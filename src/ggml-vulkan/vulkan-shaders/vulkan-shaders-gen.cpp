@@ -1131,6 +1131,14 @@ void process_shaders() {
     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "0"}});
     string_to_spv("multi_add_rms_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "1"}});
 
+    // DeepSeek V4 hyper-connection fused ops
+    string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  merge_maps(base_dict, {{"A_TYPE", "float"}}));
+    string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
+    string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
+
+    // Lightning Indexer fused op
+    string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
+
     string_to_spv("ssm_scan_f32",          "ssm_scan.comp", {{"A_TYPE", "float"}});
     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
 

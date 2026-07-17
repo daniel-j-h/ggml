@@ -1,0 +1,121 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Lightning Indexer:
+//   q[n_embd, n_head, n_tokens, n_stream]  (F32)
+//   k[n_embd, n_kv, n_stream]              (F32 only for now)
+//   weights[n_head, n_tokens, n_stream]    (F32)
+//   mask[n_kv, n_tokens, n_stream]         (F16)
+//   -> dst[n_kv, n_tokens, n_stream]       (F32)
+//
+// For each stream s, token t:
+//   For each KV position ik:
+//     score = sum_h ReLU(q[h]·k) * weights[h] + mask[ik]
+//
+// Strategy: parallelize over (ik, t, s) with subgroup reduction over n_head.
+// Each workgroup processes one (ik, t) pair, subgroup lanes handle heads.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Q { float q_data[]; };
+layout(binding = 1) readonly buffer K { float k_data[]; };
+layout(binding = 2) readonly buffer W { float w_data[]; };
+layout(binding = 3) readonly buffer M { float16_t m_data[]; };  // F16 mask
+layout(binding = 4) writeonly buffer Dst { float dst_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_embd;       // q->ne[0]
+    uint n_head;       // q->ne[1]
+    uint n_tokens;     // q->ne[2]
+    uint n_stream;     // q->ne[3]
+    uint n_kv;         // k->ne[2]
+    uint nb_q_embd;    // q->nb[0] / 4
+    uint nb_q_head;    // q->nb[1] / 4
+    uint nb_q_tok;     // q->nb[2] / 4
+    uint nb_q_strm;    // q->nb[3] / 4
+    uint nb_k_embd;    // k->nb[0] / 4
+    uint nb_k_kv;      // k->nb[2] / 4  (stride for ne[2]=n_lid, the KV index)
+    uint nb_k_strm;    // k->nb[3] / 4  (stride for ne[3]=n_stream)
+    uint nb_w_head;    // weights->nb[0] / 4
+    uint nb_w_tok;     // weights->nb[1] / 4
+    uint nb_w_strm;    // weights->nb[3] / 4
+    uint nb_m_kv;      // mask->nb[0] / 2  (F16 so 2 bytes per element)
+    uint nb_m_tok;     // mask->nb[1] / 2
+    uint ne_m_strm;    // mask->ne[3]      (for broadcasting: s % ne_m_strm)
+    uint nb_m_strm;    // mask->nb[3] / 2
+    uint nb_dst_kv;    // dst->nb[0] / 4
+    uint nb_dst_tok;   // dst->nb[1] / 4
+    uint nb_dst_strm;  // dst->nb[3] / 4
+};
+
+void main() {
+    // Workgroup handles one (ik, t, s) tuple
+    // Subgroup lanes iterate over heads
+    const uint ik = gl_WorkGroupID.x;
+    const uint t  = gl_WorkGroupID.y;
+    const uint s  = gl_WorkGroupID.z;
+
+    if (ik >= n_kv || t >= n_tokens || s >= n_stream) { return; }
+
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg_size = gl_WorkGroupSize.x;
+
+    // Each lane processes a subset of heads
+    // Total work across subgroup = n_head
+    float score_sum = 0.0;
+
+    // Iterate over heads assigned to this lane
+    for (uint h = lane; h < n_head; h += sg_size) {
+        // Dot product: q[h] · k for this (t, s, ik)
+        const uint q_base = h * nb_q_head + t * nb_q_tok + s * nb_q_strm;
+        const uint k_base = ik * nb_k_kv + s * nb_k_strm;
+
+        float qk = 0.0;
+        // Vectorized dot product over n_embd
+        uint i = 0;
+        for (; i + 4 <= n_embd; i += 4) {
+            const vec4 qv = vec4(
+                q_data[q_base + i + 0],
+                q_data[q_base + i + 1],
+                q_data[q_base + i + 2],
+                q_data[q_base + i + 3]
+            );
+            const vec4 kv = vec4(
+                k_data[k_base + i + 0],
+                k_data[k_base + i + 1],
+                k_data[k_base + i + 2],
+                k_data[k_base + i + 3]
+            );
+            qk += dot(qv, kv);
+        }
+        // Remainder for n_embd % 4
+        for (; i < n_embd; i++) {
+            qk += q_data[q_base + i] * k_data[k_base + i];
+        }
+
+        // ReLU: max(qk, 0)
+        const float relu_qk = max(qk, 0.0);
+
+        // Multiply by weight and accumulate
+        const float w_val = w_data[h * nb_w_head + t * nb_w_tok + s * nb_w_strm];
+        score_sum += relu_qk * w_val;
+    }
+
+    // Subgroup reduction over all lanes to get full score
+    const float total_score = subgroupAdd(score_sum);
+
+    // Apply mask (F16 -> F32 conversion). The mask may have fewer streams (broadcasting)
+    // so we use s % ne_m_strm to handle the broadcast case (matching CPU s%%nem3).
+    const uint mask_stride = (ne_m_strm > 0) ? (s % ne_m_strm) : 0u;
+    const uint mask_idx = ik * nb_m_kv + t * nb_m_tok + mask_stride * nb_m_strm;
+    const float mask_val = float(m_data[mask_idx]);
+
+    // Only lane 0 writes the result
+    if (lane == 0) {
+        dst_data[ik * nb_dst_kv + t * nb_dst_tok + s * nb_dst_strm] = total_score + mask_val;
+    }
+}
